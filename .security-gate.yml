@@ -1,0 +1,3 @@
+version: 1
+block_on: HIGH
+warn_on: MEDIUM

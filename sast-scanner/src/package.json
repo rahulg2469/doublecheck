@@ -1,0 +1,24 @@
+{
+  "name": "sast-scanner",
+  "version": "1.0.0",
+  "description": "Static Application Security Testing (SAST) Scanner for Node.js applications",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "sast",
+    "security",
+    "scanner",
+    "vulnerability",
+    "static-analysis"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
