@@ -14,7 +14,7 @@ import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-sec
 const exec = promisify(execFile);
 const QUEUE_URL = process.env.QUEUE_URL;
 const TOKEN_SECRET_ID = process.env.TOKEN_SECRET_ID || "doublecheck/github-token";
-const SCANNER_URL = process.env.SCANNER_URL || "http://localhost:3000";
+const SCANNER_URL = process.env.SCANNER_URL || "http://127.0.0.1:3000"; // IPv4: "localhost" can resolve to IPv6 and hang
 
 const sqs = new SQSClient({});
 const sm = new SecretsManagerClient({});
@@ -29,11 +29,14 @@ server.on("exit", (code) => {
 });
 
 async function waitForScanner() {
-  for (let i = 0; i < 30; i++) {
+  console.log("Waiting for scanner server at", SCANNER_URL);
+  for (let i = 1; i <= 30; i++) {
     try {
-      const r = await fetch(`${SCANNER_URL}/health`);
+      const r = await fetch(`${SCANNER_URL}/health`, { signal: AbortSignal.timeout(2000) });
       if (r.ok) return console.log("Scanner server is healthy");
-    } catch { /* not up yet */ }
+    } catch (err) {
+      console.log(`Health check ${i}/30 not ready yet: ${err.cause?.code || err.name}`);
+    }
     await new Promise((r) => setTimeout(r, 1000));
   }
   throw new Error("Scanner server did not become healthy");
