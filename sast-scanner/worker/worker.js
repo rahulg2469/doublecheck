@@ -88,12 +88,13 @@ async function processJob(job) {
   const { workDir, codeDir } = await downloadCode(job.repo, job.commitSha);
   try {
     const result = await scan(codeDir);
-    const vulns = result.vulnerabilities || [];
+    // /scan/directory returns { summary, results: { "<file path>": [findings...] } }
+    const vulns = Object.values(result.results || {}).flat();
     const counts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
     vulns.forEach((v) => { if (counts[v.severity] !== undefined) counts[v.severity]++; });
     console.log("Job finished", {
       jobId: job.jobId, repo: job.repo, pr: job.pr, commitSha: job.commitSha,
-      counts, total: vulns.length, durationMs: Date.now() - started,
+      filesScanned: result.summary?.filesScanned, counts, total: vulns.length, durationMs: Date.now() - started,
     });
     // Short preview of findings (file paths made relative to the repo)
     vulns.slice(0, 10).forEach((v) =>
