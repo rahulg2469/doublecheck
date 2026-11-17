@@ -1,0 +1,3 @@
+# Copy to terraform.tfvars and fill in your account ID and image tags
+staging_image = "<accountId>.dkr.ecr.us-east-1.amazonaws.com/doublecheck/staging-app:<tag>"
+pentest_image = "<accountId>.dkr.ecr.us-east-1.amazonaws.com/doublecheck/pentest-worker:<tag>"
