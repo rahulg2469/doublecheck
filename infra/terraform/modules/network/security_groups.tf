@@ -4,35 +4,35 @@
 # traffic allowed is what is written here.
 
 resource "aws_security_group" "pentest_worker" {
-  name        = "sg-pentest-worker"
+  name        = "doublecheck-pentest-worker"
   description = "Pentest worker: no inbound; HTTP to the staging ALB, HTTPS to AWS"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-pentest-worker" }
 }
 
 resource "aws_security_group" "staging_alb" {
-  name        = "sg-staging-alb"
+  name        = "doublecheck-staging-alb"
   description = "Internal staging ALB: HTTP only from the pentest worker"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-staging-alb" }
 }
 
 resource "aws_security_group" "staging_app" {
-  name        = "sg-staging-app"
+  name        = "doublecheck-staging-app"
   description = "Staging app: app port only from the staging ALB"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-staging-app" }
 }
 
 resource "aws_security_group" "sast_scanner" {
-  name        = "sg-sast-scanner"
+  name        = "doublecheck-sast-scanner"
   description = "SAST scanner: no inbound; HTTPS out (GitHub via NAT, AWS APIs)"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-sast-scanner" }
 }
 
 resource "aws_security_group" "endpoints" {
-  name        = "sg-vpc-endpoints"
+  name        = "doublecheck-vpc-endpoints"
   description = "Interface endpoints: HTTPS from inside the VPC"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-vpc-endpoints" }
@@ -120,7 +120,7 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
 # the ALB's inbound rule is what stopped it.
 resource "aws_security_group" "outsider" {
   count       = var.create_outsider_sg ? 1 : 0
-  name        = "sg-outsider-test"
+  name        = "doublecheck-outsider-test"
   description = "TEST ONLY: open egress, not allowed by the staging ALB"
   vpc_id      = aws_vpc.this.id
   tags        = { Name = "sg-outsider-test" }
