@@ -1,7 +1,7 @@
 // DoubleCheck - SAST worker
 // Pulls SAST jobs from SQS, downloads the PR's code at the exact commit,
-// scans it with the course scanner (POST /scan/directory) and logs the result.
-// (Next: post the PR status + comment, save results to S3/DynamoDB.)
+// scans it with the course scanner (POST /scan/directory) and sets the PR status.
+// (Next: PR comment, thresholds from .security-gate.yml, S3/DynamoDB results.)
 
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,6 +14,8 @@ import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-sec
 const exec = promisify(execFile);
 const QUEUE_URL = process.env.QUEUE_URL;
 const TOKEN_SECRET_ID = process.env.TOKEN_SECRET_ID || "doublecheck/github-token";
+const STATUS_CONTEXT = "DoubleCheck / SAST";
+const MAX_ATTEMPTS = 3; // must match the queue's maxReceiveCount
 const SCANNER_URL = process.env.SCANNER_URL || "http://127.0.0.1:3000"; // IPv4: "localhost" can resolve to IPv6 and hang
 
 const sqs = new SQSClient({});
@@ -49,6 +51,21 @@ async function getToken() {
     token = out.SecretString.trim();
   }
   return token;
+}
+
+// Sets the commit status shown on the PR (pending / success / failure / error)
+async function setStatus(repo, sha, state, description) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${await getToken()}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "doublecheck-sast-worker",
+    },
+    body: JSON.stringify({ state, context: STATUS_CONTEXT, description: description.slice(0, 140) }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`GitHub status ${res.status}: ${await res.text()}`);
 }
 
 // 3a. Download + unpack the repo at the job's commit
@@ -96,6 +113,13 @@ async function processJob(job) {
       jobId: job.jobId, repo: job.repo, pr: job.pr, commitSha: job.commitSha,
       filesScanned: result.summary?.filesScanned, counts, total: vulns.length, durationMs: Date.now() - started,
     });
+    // Decision (for now: any HIGH blocks; thresholds from .security-gate.yml come next)
+    const state = counts.HIGH > 0 ? "failure" : "success";
+    const description = `${counts.HIGH} HIGH, ${counts.MEDIUM} MEDIUM, ${counts.LOW} LOW` +
+      (state === "failure" ? " - merge blocked" : " - passed");
+    await setStatus(job.repo, job.commitSha, state, description);
+    console.log("Status set", { pr: job.pr, state, description });
+
     // Short preview of findings (file paths made relative to the repo)
     vulns.slice(0, 10).forEach((v) =>
       console.log(`  ${v.severity}  ${v.id}  ${String(v.file).replace(codeDir + "/", "")}:${v.line}`));
@@ -113,14 +137,27 @@ async function main() {
   while (running) {
     const out = await sqs.send(new ReceiveMessageCommand({
       QueueUrl: QUEUE_URL, MaxNumberOfMessages: 1, WaitTimeSeconds: 20,
+      AttributeNames: ["ApproximateReceiveCount"],
     }));
     for (const msg of out.Messages || []) {
+      const attempt = Number(msg.Attributes?.ApproximateReceiveCount || 1);
+      let job;
       try {
-        await processJob(JSON.parse(msg.Body));
+        job = JSON.parse(msg.Body);
+        await processJob(job);
         await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE_URL, ReceiptHandle: msg.ReceiptHandle }));
       } catch (err) {
-        // Not deleted: SQS makes it visible again for a retry; after 3 tries it goes to the DLQ
-        console.error("Job failed, will be retried", { error: err.message, messageId: msg.MessageId });
+        // Not deleted: SQS makes it visible again for a retry; after the last try it goes to the DLQ
+        console.error("Job failed", { error: err.message, attempt, maxAttempts: MAX_ATTEMPTS, messageId: msg.MessageId });
+        if (job && attempt >= MAX_ATTEMPTS) {
+          // Last try: never leave the PR stuck on "pending"
+          try {
+            await setStatus(job.repo, job.commitSha, "error", "DoubleCheck could not complete the scan - push again to retry");
+            console.log("Status set to error after final attempt", { pr: job.pr });
+          } catch (e) {
+            console.error("Could not set error status", { error: e.message });
+          }
+        }
       }
     }
   }

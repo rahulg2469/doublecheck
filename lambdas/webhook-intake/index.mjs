@@ -1,6 +1,6 @@
 // DoubleCheck - webhook intake Lambda
-// Verifies GitHub's signature, then queues a SAST job for every opened/updated PR.
-// (Next: set the PR status to pending + record jobs in DynamoDB.)
+// Verifies GitHub's signature, sets the PR status to pending,
+// then queues a SAST job for every opened/updated PR.
 
 import crypto from "node:crypto";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
@@ -9,6 +9,8 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 const sm = new SecretsManagerClient({});
 const sqs = new SQSClient({});
 let cachedSecret; // reused while the Lambda stays warm
+let cachedToken;
+const STATUS_CONTEXT = "DoubleCheck / SAST";
 
 async function getSecret() {
   if (!cachedSecret) {
@@ -16,6 +18,29 @@ async function getSecret() {
     cachedSecret = out.SecretString;
   }
   return cachedSecret;
+}
+
+async function getToken() {
+  if (!cachedToken) {
+    const out = await sm.send(new GetSecretValueCommand({ SecretId: process.env.TOKEN_SECRET_ID }));
+    cachedToken = out.SecretString.trim();
+  }
+  return cachedToken;
+}
+
+// Sets the commit status shown on the PR (pending / success / failure / error)
+async function setStatus(repo, sha, state, description) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${await getToken()}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "doublecheck-webhook-intake",
+    },
+    body: JSON.stringify({ state, context: STATUS_CONTEXT, description: description.slice(0, 140) }),
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!res.ok) throw new Error(`GitHub status ${res.status}: ${await res.text()}`);
 }
 
 // GitHub signs the raw body with HMAC-SHA256 using the shared secret
@@ -82,6 +107,12 @@ export const handler = async (event) => {
         deliveryId,
         requestedAt: new Date().toISOString(),
       };
+      // Pending FIRST, then queue: otherwise a fast worker's result could be overwritten by "pending"
+      try {
+        await setStatus(job.repo, job.commitSha, "pending", "Scan queued");
+      } catch (err) {
+        console.warn("Could not set pending status (scan still queued)", { error: err.message });
+      }
       await sqs.send(new SendMessageCommand({ QueueUrl: process.env.QUEUE_URL, MessageBody: JSON.stringify(job) }));
       console.log("SAST job queued", job);
       return reply(202, "scan accepted");
