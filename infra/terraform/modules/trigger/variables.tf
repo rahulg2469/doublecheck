@@ -1,0 +1,9 @@
+variable "name" { type = string }
+variable "role_arn" { type = string }
+variable "lambdas_dir" { type = string }
+variable "cluster_arn" { type = string }
+variable "task_family" { type = string }
+variable "subnet_ids" { type = list(string) }
+variable "security_group_id" { type = string }
+variable "allowed_target" { type = string }
+variable "default_endpoints" { type = list(string) }

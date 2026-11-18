@@ -6,6 +6,14 @@ terraform {
       source  = "hashicorp/aws"
       version = ">= 6.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.6"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = ">= 2.4"
+    }
   }
 
   # Remote state in S3, created once by infra/scripts/bootstrap-state.sh.

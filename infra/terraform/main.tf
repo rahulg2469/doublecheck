@@ -37,3 +37,17 @@ module "pentest" {
   image    = var.pentest_image
   role_arn = local.lab_role_arn
 }
+
+module "trigger" {
+  source = "./modules/trigger"
+
+  name              = var.name
+  role_arn          = local.lab_role_arn
+  lambdas_dir       = "${path.root}/../../lambdas"
+  cluster_arn       = module.staging.cluster_arn
+  task_family       = module.pentest.task_family
+  subnet_ids        = module.network.private_subnet_ids
+  security_group_id = module.network.sg_pentest_worker_id
+  allowed_target    = "http://${module.staging.alb_dns_name}"
+  default_endpoints = var.default_endpoints
+}

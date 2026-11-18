@@ -48,3 +48,9 @@ variable "create_outsider_sg" {
   type        = bool
   default     = true
 }
+
+variable "default_endpoints" {
+  description = "Paths to attack when a deploy does not list its own"
+  type        = list(string)
+  default     = ["/api/users", "/api/user?id=1", "/api/login", "/api/data", "/api/process"]
+}

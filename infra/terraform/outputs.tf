@@ -50,3 +50,13 @@ output "staging_commit" {
   description = "Image tag of the deployed staging app (the commit SHA)"
   value       = try(regex(":([^:/]+)$", var.staging_image)[0], "unknown")
 }
+
+output "pentest_trigger_url" {
+  description = "Public HTTPS endpoint the deploy job calls (signed requests only)"
+  value       = module.trigger.trigger_url
+}
+
+output "pentest_trigger_secret" {
+  description = "Secrets Manager name of the shared signing secret"
+  value       = module.trigger.secret_name
+}
