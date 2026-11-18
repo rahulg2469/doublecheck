@@ -1,7 +1,8 @@
 // DoubleCheck - SAST worker
 // Pulls SAST jobs from SQS, downloads the PR's code at the exact commit,
-// scans it with the course scanner (POST /scan/directory) and sets the PR status.
-// (Next: PR comment, thresholds from .security-gate.yml, S3/DynamoDB results.)
+// scans it with the course scanner (POST /scan/directory), sets the PR status
+// and posts (or updates) one PR comment with masked findings.
+// (Next: thresholds from .security-gate.yml, S3/DynamoDB results.)
 
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -15,6 +16,8 @@ const exec = promisify(execFile);
 const QUEUE_URL = process.env.QUEUE_URL;
 const TOKEN_SECRET_ID = process.env.TOKEN_SECRET_ID || "doublecheck/github-token";
 const STATUS_CONTEXT = "DoubleCheck / SAST";
+const COMMENT_MARKER = "<!-- doublecheck:sast -->"; // finds our own comment again
+const MAX_LISTED = 25; // findings shown in the comment
 const MAX_ATTEMPTS = 3; // must match the queue's maxReceiveCount
 const SCANNER_URL = process.env.SCANNER_URL || "http://127.0.0.1:3000"; // IPv4: "localhost" can resolve to IPv6 and hang
 
@@ -53,19 +56,79 @@ async function getToken() {
   return token;
 }
 
-// Sets the commit status shown on the PR (pending / success / failure / error)
-async function setStatus(repo, sha, state, description) {
-  const res = await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
-    method: "POST",
+// Small GitHub API helper
+async function github(method, apiPath, body) {
+  const res = await fetch(`https://api.github.com${apiPath}`, {
+    method,
     headers: {
       Authorization: `Bearer ${await getToken()}`,
       Accept: "application/vnd.github+json",
       "User-Agent": "doublecheck-sast-worker",
     },
-    body: JSON.stringify({ state, context: STATUS_CONTEXT, description: description.slice(0, 140) }),
-    signal: AbortSignal.timeout(5000),
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(8000),
   });
-  if (!res.ok) throw new Error(`GitHub status ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`GitHub ${method} ${apiPath} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.status === 204 ? null : res.json();
+}
+
+// Sets the commit status shown on the PR (pending / success / failure / error)
+async function setStatus(repo, sha, state, description) {
+  await github("POST", `/repos/${repo}/statuses/${sha}`,
+    { state, context: STATUS_CONTEXT, description: description.slice(0, 140) });
+}
+
+// ---------- PR comment ----------
+const SEVERITY_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+
+// Secret-type findings: keep the first 2 characters of any quoted value, mask the rest
+function maskEvidence(finding) {
+  const text = String(finding.evidence || "").trim();
+  if (!/SECRET|SENSITIVE|PASSWORD|TOKEN|KEY|CREDENTIAL/i.test(String(finding.id))) return text;
+  return text.replace(/(["'`])([^"'`]{0,200})\1/g, (m, q, val) =>
+    val.length <= 2 ? m : `${q}${val.slice(0, 2)}****${q}`);
+}
+
+// Keep table cells on one line and stop them breaking the markdown
+const cell = (t) => String(t ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+const code = (t) => "`" + cell(t).replace(/`/g, "'").slice(0, 100) + "`";
+
+function buildComment(job, { state, counts, vulns, filesScanned, durationMs, codeDir }) {
+  const short = job.commitSha.slice(0, 7);
+  const head = state === "failure" ? "❌ **DoubleCheck SAST: merge blocked**"
+    : vulns.length ? "⚠️ **DoubleCheck SAST: passed with warnings**"
+    : "✅ **DoubleCheck SAST: no issues found**";
+  const lines = [
+    COMMENT_MARKER,
+    head,
+    "",
+    `**${counts.HIGH} HIGH** · **${counts.MEDIUM} MEDIUM** · **${counts.LOW} LOW** in ${filesScanned ?? "?"} files · commit \`${short}\` · ${(durationMs / 1000).toFixed(1)}s`,
+    "",
+  ];
+  if (vulns.length) {
+    const sorted = [...vulns].sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
+    lines.push("| Severity | Rule | Location | Evidence | Fix |", "| --- | --- | --- | --- | --- |");
+    for (const v of sorted.slice(0, MAX_LISTED)) {
+      const rel = path.isAbsolute(String(v.file)) ? path.relative(codeDir, v.file) : String(v.file);
+      const link = `[${cell(rel)}:${v.line}](https://github.com/${job.repo}/blob/${job.commitSha}/${rel}#L${v.line})`;
+      lines.push(`| ${v.severity} | ${cell(v.id)} | ${link} | ${code(maskEvidence(v))} | ${cell(v.message || v.description)} |`);
+    }
+    if (sorted.length > MAX_LISTED) lines.push("", `…and **${sorted.length - MAX_LISTED} more** findings.`);
+  }
+  lines.push("", `<sub>Rule: block on HIGH (default). Updated on every push; secrets are masked.</sub>`);
+  return lines.join("\n");
+}
+
+// One comment per PR: edit ours if it exists, otherwise create it
+async function upsertComment(repo, pr, body) {
+  const comments = await github("GET", `/repos/${repo}/issues/${pr}/comments?per_page=100`);
+  const mine = comments.find((c) => c.body && c.body.includes(COMMENT_MARKER));
+  if (mine) {
+    await github("PATCH", `/repos/${repo}/issues/comments/${mine.id}`, { body });
+    return "updated";
+  }
+  await github("POST", `/repos/${repo}/issues/${pr}/comments`, { body });
+  return "created";
 }
 
 // 3a. Download + unpack the repo at the job's commit
@@ -119,6 +182,18 @@ async function processJob(job) {
       (state === "failure" ? " - merge blocked" : " - passed");
     await setStatus(job.repo, job.commitSha, state, description);
     console.log("Status set", { pr: job.pr, state, description });
+
+    // PR comment (a failure here must not undo the status or retry the scan)
+    try {
+      const body = buildComment(job, {
+        state, counts, vulns, filesScanned: result.summary?.filesScanned,
+        durationMs: Date.now() - started, codeDir,
+      });
+      const action = await upsertComment(job.repo, job.pr, body);
+      console.log("PR comment " + action, { pr: job.pr });
+    } catch (err) {
+      console.warn("Could not post PR comment", { error: err.message });
+    }
 
     // Short preview of findings (file paths made relative to the repo)
     vulns.slice(0, 10).forEach((v) =>
