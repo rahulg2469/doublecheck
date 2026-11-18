@@ -54,3 +54,9 @@ variable "default_endpoints" {
   type        = list(string)
   default     = ["/api/users", "/api/user?id=1", "/api/login", "/api/data", "/api/process"]
 }
+
+variable "alert_email" {
+  description = "Where pentest alerts are emailed (empty = no subscription)"
+  type        = string
+  default     = ""
+}

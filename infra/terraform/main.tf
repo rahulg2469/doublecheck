@@ -51,3 +51,13 @@ module "trigger" {
   allowed_target    = "http://${module.staging.alb_dns_name}"
   default_endpoints = var.default_endpoints
 }
+
+module "alerts" {
+  source = "./modules/alerts"
+
+  name           = var.name
+  role_arn       = local.lab_role_arn
+  lambdas_dir    = "${path.root}/../../lambdas"
+  reports_bucket = module.pentest.reports_bucket
+  alert_email    = var.alert_email
+}

@@ -60,3 +60,7 @@ output "pentest_trigger_secret" {
   description = "Secrets Manager name of the shared signing secret"
   value       = module.trigger.secret_name
 }
+
+output "alerts_topic_arn" {
+  value = module.alerts.topic_arn
+}

@@ -4,3 +4,4 @@
 terraform.tfvars
 crash.log
 modules/trigger/.build/
+modules/alerts/.build/
