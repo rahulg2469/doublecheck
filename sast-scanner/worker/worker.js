@@ -2,7 +2,8 @@
 // Pulls SAST jobs from SQS, downloads the PR's code at the exact commit,
 // scans it with the course scanner (POST /scan/directory), sets the PR status
 // and posts (or updates) one PR comment with masked findings.
-// (Next: thresholds from .security-gate.yml, S3/DynamoDB results.)
+// Block/warn thresholds come from .security-gate.yml on the PR's BASE branch,
+// so a PR can't loosen its own rules. (Next: S3/DynamoDB results.)
 
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from "@aws-sdk/client-sqs";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import yaml from "js-yaml";
 
 const exec = promisify(execFile);
 const QUEUE_URL = process.env.QUEUE_URL;
@@ -78,6 +80,39 @@ async function setStatus(repo, sha, state, description) {
     { state, context: STATUS_CONTEXT, description: description.slice(0, 140) });
 }
 
+// ---------- Thresholds (.security-gate.yml) ----------
+const RANK = { LOW: 1, MEDIUM: 2, HIGH: 3 };
+const DEFAULT_CONFIG = { block_on: "HIGH", warn_on: "MEDIUM" };
+
+// Read the gate config from the PR's base branch (e.g. main), never from the PR itself
+async function loadConfig(repo, baseBranch) {
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/contents/.security-gate.yml?ref=${encodeURIComponent(baseBranch)}`, {
+      headers: {
+        Authorization: `Bearer ${await getToken()}`,
+        Accept: "application/vnd.github.raw",
+        "User-Agent": "doublecheck-sast-worker",
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+  if (res.status === 404) return { ...DEFAULT_CONFIG, source: "defaults (no .security-gate.yml)" };
+  if (!res.ok) throw new Error(`Could not read .security-gate.yml: ${res.status}`);
+
+  let parsed;
+  try {
+    parsed = yaml.load(await res.text(), { schema: yaml.FAILSAFE_SCHEMA }) || {};
+  } catch {
+    return { ...DEFAULT_CONFIG, source: "defaults (.security-gate.yml is not valid YAML)" };
+  }
+  const block = String(parsed.block_on || DEFAULT_CONFIG.block_on).toUpperCase();
+  let warn = String(parsed.warn_on || DEFAULT_CONFIG.warn_on).toUpperCase();
+  if (!RANK[block] || !RANK[warn]) {
+    return { ...DEFAULT_CONFIG, source: "defaults (.security-gate.yml has invalid severities)" };
+  }
+  if (RANK[warn] > RANK[block]) warn = block; // warn above block makes no sense: treat as equal
+  return { block_on: block, warn_on: warn, source: `.security-gate.yml on ${baseBranch}` };
+}
+
 // ---------- PR comment ----------
 const SEVERITY_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2 };
 
@@ -93,7 +128,7 @@ function maskEvidence(finding) {
 const cell = (t) => String(t ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
 const code = (t) => "`" + cell(t).replace(/`/g, "'").slice(0, 100) + "`";
 
-function buildComment(job, { state, counts, vulns, filesScanned, durationMs, codeDir }) {
+function buildComment(job, { state, counts, vulns, hidden, config, filesScanned, durationMs, codeDir }) {
   const short = job.commitSha.slice(0, 7);
   const head = state === "failure" ? "❌ **DoubleCheck SAST: merge blocked**"
     : vulns.length ? "⚠️ **DoubleCheck SAST: passed with warnings**"
@@ -115,7 +150,9 @@ function buildComment(job, { state, counts, vulns, filesScanned, durationMs, cod
     }
     if (sorted.length > MAX_LISTED) lines.push("", `…and **${sorted.length - MAX_LISTED} more** findings.`);
   }
-  lines.push("", `<sub>Rule: block on HIGH (default). Updated on every push; secrets are masked.</sub>`);
+  if (hidden > 0) lines.push("", `${hidden} lower-severity finding(s) below \`warn_on: ${config.warn_on}\` are not shown.`);
+  lines.push("", `<sub>Rules: block on ${config.block_on}, warn on ${config.warn_on} · from ${config.source}. ` +
+    `Updated on every push; secrets are masked.</sub>`);
   return lines.join("\n");
 }
 
@@ -176,18 +213,24 @@ async function processJob(job) {
       jobId: job.jobId, repo: job.repo, pr: job.pr, commitSha: job.commitSha,
       filesScanned: result.summary?.filesScanned, counts, total: vulns.length, durationMs: Date.now() - started,
     });
-    // Decision (for now: any HIGH blocks; thresholds from .security-gate.yml come next)
-    const state = counts.HIGH > 0 ? "failure" : "success";
-    const description = `${counts.HIGH} HIGH, ${counts.MEDIUM} MEDIUM, ${counts.LOW} LOW` +
-      (state === "failure" ? " - merge blocked" : " - passed");
+    // Decision from the base branch's .security-gate.yml
+    const config = await loadConfig(job.repo, job.baseBranch || "main");
+    const blocking = vulns.filter((v) => (RANK[v.severity] || 0) >= RANK[config.block_on]);
+    const shown = vulns.filter((v) => (RANK[v.severity] || 0) >= RANK[config.warn_on]);
+    const warnings = shown.length - blocking.length;
+    const state = blocking.length > 0 ? "failure" : "success";
+    const totals = `${counts.HIGH} HIGH, ${counts.MEDIUM} MEDIUM, ${counts.LOW} LOW`;
+    const description = state === "failure"
+      ? `Merge blocked: ${blocking.length} at or above ${config.block_on} (${totals})`
+      : warnings > 0 ? `Passed with ${warnings} warning(s) (${totals})` : `Passed (${totals})`;
     await setStatus(job.repo, job.commitSha, state, description);
-    console.log("Status set", { pr: job.pr, state, description });
+    console.log("Status set", { pr: job.pr, state, description, config });
 
     // PR comment (a failure here must not undo the status or retry the scan)
     try {
       const body = buildComment(job, {
-        state, counts, vulns, filesScanned: result.summary?.filesScanned,
-        durationMs: Date.now() - started, codeDir,
+        state, counts, vulns: shown, hidden: vulns.length - shown.length, config,
+        filesScanned: result.summary?.filesScanned, durationMs: Date.now() - started, codeDir,
       });
       const action = await upsertComment(job.repo, job.pr, body);
       console.log("PR comment " + action, { pr: job.pr });
