@@ -59,5 +59,5 @@ module "alerts" {
   role_arn       = local.lab_role_arn
   lambdas_dir    = "${path.root}/../../lambdas"
   reports_bucket = module.pentest.reports_bucket
-  alert_email    = var.alert_email
+  alert_emails   = var.alert_emails
 }

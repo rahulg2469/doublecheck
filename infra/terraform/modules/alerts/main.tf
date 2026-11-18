@@ -5,12 +5,13 @@ resource "aws_sns_topic" "alerts" {
   name = "${var.name}-pentest-alerts"
 }
 
-# AWS emails a confirmation link first; alerts arrive only after it is clicked
+# AWS emails each person a confirmation link first; alerts arrive only after they click it
+# One subscription per team member
 resource "aws_sns_topic_subscription" "email" {
-  count     = var.alert_email == "" ? 0 : 1
+  for_each  = toset(var.alert_emails)
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
-  endpoint  = var.alert_email
+  endpoint  = each.value
 }
 
 data "archive_file" "alerts" {
