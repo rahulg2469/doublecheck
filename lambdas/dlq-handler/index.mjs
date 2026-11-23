@@ -42,7 +42,8 @@ async function markJob(jobId, error) {
   await ddb.send(new UpdateItemCommand({
     TableName: process.env.JOBS_TABLE,
     Key: { jobId: { S: jobId } },
-    UpdateExpression: "SET #s = :s, updatedAt = :u, #e = :e",
+    // if_not_exists: a job with no PENDING row still gets createdAt, so it shows up in the ByStatus index
+    UpdateExpression: "SET #s = :s, updatedAt = :u, #e = :e, createdAt = if_not_exists(createdAt, :u)",
     ExpressionAttributeNames: { "#s": "status", "#e": "error" },
     ExpressionAttributeValues: { ":s": { S: "ERROR" }, ":u": { S: now }, ":e": { S: error } },
   }));
