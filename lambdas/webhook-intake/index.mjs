@@ -1,6 +1,6 @@
 // DoubleCheck - webhook intake Lambda
 // Verifies GitHub's signature, sets the PR status to pending,
-// queues a SAST job for every opened/updated PR, and records
+// records the job as PENDING, queues a SAST job for every opened/updated PR, and records
 // merge commit -> PR in DynamoDB so Stage 2 can link pentest results back to the PR.
 
 import crypto from "node:crypto";
@@ -110,6 +110,23 @@ export const handler = async (event) => {
         deliveryId,
         requestedAt: new Date().toISOString(),
       };
+      // Track the job (doublecheck-jobs) so the sweeper can find stuck ones; never block the scan on it
+      try {
+        const now = new Date();
+        await ddb.send(new PutItemCommand({
+          TableName: process.env.JOBS_TABLE,
+          Item: {
+            jobId: { S: job.jobId }, status: { S: "PENDING" }, scanType: { S: "sast" },
+            repo: { S: job.repo }, pr: { N: String(job.pr) }, commitSha: { S: job.commitSha },
+            branch: { S: job.branch }, deliveryId: { S: String(deliveryId || "") }, attempts: { N: "0" },
+            createdAt: { S: now.toISOString() }, updatedAt: { S: now.toISOString() },
+            expiresAt: { N: String(Math.floor(now.getTime() / 1000) + 30 * 24 * 3600) }, // TTL: 30 days
+          },
+        }));
+      } catch (err) {
+        console.warn("Could not record job (scan still queued)", { error: err.message });
+      }
+
       // Pending FIRST, then queue: otherwise a fast worker's result could be overwritten by "pending"
       try {
         await setStatus(job.repo, job.commitSha, "pending", "Scan queued");
