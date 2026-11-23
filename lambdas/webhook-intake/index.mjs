@@ -1,13 +1,16 @@
 // DoubleCheck - webhook intake Lambda
 // Verifies GitHub's signature, sets the PR status to pending,
-// then queues a SAST job for every opened/updated PR.
+// queues a SAST job for every opened/updated PR, and records
+// merge commit -> PR in DynamoDB so Stage 2 can link pentest results back to the PR.
 
 import crypto from "node:crypto";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
+import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
 
 const sm = new SecretsManagerClient({});
 const sqs = new SQSClient({});
+const ddb = new DynamoDBClient({});
 let cachedSecret; // reused while the Lambda stays warm
 let cachedToken;
 const STATUS_CONTEXT = "DoubleCheck / SAST";
@@ -119,7 +122,26 @@ export const handler = async (event) => {
     }
 
     if (payload.action === "closed" && pr.merged) {
-      console.log("PR merged", { ...info, mergeCommitSha: pr.merge_commit_sha }); // next: Merges table
+      // Merges table (contracts section 6): merge commit -> PR, used by Stage 2's follow-up comments
+      const item = {
+        repo: { S: info.repo },
+        commitSha: { S: pr.merge_commit_sha },
+        pr: { N: String(info.pr) },
+        headBranch: { S: info.branch },
+        headSha: { S: info.commitSha },
+        baseBranch: { S: info.baseBranch },
+        mergedAt: { S: pr.merged_at || new Date().toISOString() },
+        title: { S: (pr.title || "").slice(0, 300) },
+        schemaVersion: { N: "1" },
+      };
+      try {
+        await ddb.send(new PutItemCommand({ TableName: process.env.MERGES_TABLE, Item: item }));
+      } catch (err) {
+        // 500 makes the failure visible in GitHub's webhook deliveries (and redeliverable)
+        console.error("Could not record merge", { error: err.message, repo: info.repo, pr: info.pr });
+        return reply(500, "could not record merge");
+      }
+      console.log("PR merge recorded", { repo: info.repo, pr: info.pr, mergeCommitSha: pr.merge_commit_sha });
       return reply(200, "merge recorded");
     }
   }
